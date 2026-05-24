@@ -14,15 +14,23 @@ wss.on("connection", (ws) => {
     let room = null;   // array of slots for this room
     let slot = -1;     // this client's slot index
 
+    // Send a server-hello (0xFE) immediately so clients that don't receive
+    // network_type_connect (e.g. GXC/GX.games WASM runner) can still
+    // trigger the room-join sequence from a network_type_data event instead.
+    ws.send(Buffer.from([0xFE]));
+
     ws.on("message", (data, isBinary) => {
         // data is always a Buffer from the ws library
         if (!Buffer.isBuffer(data)) data = Buffer.from(data);
 
         // ---- Room-join handshake ----
-        // Client sends [0xFD, code_hi, code_lo] before any game packets.
+        // Client sends [0xFD, code_hi, code_lo] to join a room.
+        // Silently drop a duplicate join if already in a room.
+        if (data.length >= 1 && data[0] === 0xFD && room !== null) return;
+
         if (room === null) {
             if (data.length < 3 || data[0] !== 0xFD) {
-                // Not a join packet; echo it back (handles GMS desktop handshake)
+                // Not a join packet — echo it back (handles any GMS desktop handshake)
                 ws.send(data);
                 return;
             }
@@ -33,13 +41,12 @@ wss.on("connection", (ws) => {
 
             slot = room.findIndex(s => s === null);
             if (slot === -1) {
-                // Room full
                 ws.close(1008, "Room full");
                 return;
             }
             room[slot] = ws;
 
-            // Tell the client its player ID slot (NET_MSG.PLAYER_JOIN = 0, flag 255 = ID assignment)
+            // Tell the client its player ID (NET_MSG.PLAYER_JOIN = 0, flag 255 = ID assignment)
             ws.send(Buffer.from([0, slot, 255]));
             console.log(`Room ${code}: slot ${slot} joined (${room.filter(Boolean).length} connected)`);
             return;
