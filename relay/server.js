@@ -43,18 +43,28 @@ setInterval(() => {
     }
 }, 10000);
 
-// POST /join   body: {"code":1234}   → {"pid":0}
+// POST /join   body: {"code":1234,"create":true}  (host)
+//              body: {"code":1234}                 (client — room must already exist)
+// → {"pid":0}
 app.post("/join", (req, res) => {
     let body;
     try { body = JSON.parse(req.body); }
     catch (e) { return res.status(400).json({ error: "bad json", raw: req.body }); }
 
-    const code = body.code;
+    const code   = body.code;
+    const create = body.create === true;
+
     if (typeof code !== "number" || code < 1000 || code > 9999)
         return res.status(400).json({ error: "bad code", got: code });
 
-    if (!rooms[code])
+    if (create) {
+        // Host: create the room (or reclaim it if it somehow still exists)
         rooms[code] = { slots: new Array(10).fill(false), players: {} };
+    } else if (!rooms[code]) {
+        // Client: room must already exist
+        return res.status(404).json({ error: "room not found" });
+    }
+
     const room = rooms[code];
 
     const pid = room.slots.findIndex(s => !s);
