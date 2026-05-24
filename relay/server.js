@@ -1,13 +1,21 @@
 // SMS Among Us - HTTP Relay Server
 // Deploy to Render.com as a Node.js web service.
-// Players POST to /join, POST to /broadcast, GET /poll, POST to /leave.
 
 const express = require("express");
 const cors    = require("cors");
 const app     = express();
 
 app.use(cors());
-app.use(express.text({ type: "*/*" })); // read any POST body as plain text
+
+// Read raw POST body as a string regardless of Content-Type.
+// http_post_string in GameMaker GXC often omits the Content-Type header,
+// so express.text() would leave req.body undefined. This always works.
+app.use((req, res, next) => {
+    if (req.method !== "POST") return next();
+    let raw = "";
+    req.on("data", chunk => { raw += chunk.toString(); });
+    req.on("end", () => { req.body = raw; next(); });
+});
 
 // rooms[code] = { slots: bool[10], players: { pid: { lastSeen, queue[] } } }
 const rooms = {};
@@ -39,11 +47,11 @@ setInterval(() => {
 app.post("/join", (req, res) => {
     let body;
     try { body = JSON.parse(req.body); }
-    catch { return res.status(400).json({ error: "bad json" }); }
+    catch (e) { return res.status(400).json({ error: "bad json", raw: req.body }); }
 
     const code = body.code;
     if (typeof code !== "number" || code < 1000 || code > 9999)
-        return res.status(400).json({ error: "bad code" });
+        return res.status(400).json({ error: "bad code", got: code });
 
     if (!rooms[code])
         rooms[code] = { slots: new Array(10).fill(false), players: {} };
@@ -59,11 +67,11 @@ app.post("/join", (req, res) => {
     res.json({ pid });
 });
 
-// POST /broadcast   body: {"code":1234,"pid":0,"data":"0,5,255"}   → {"ok":true}
+// POST /broadcast   body: {"code":1234,"pid":0,"data":"0,5,255"}
 app.post("/broadcast", (req, res) => {
     let body;
     try { body = JSON.parse(req.body); }
-    catch { return res.status(400).json({ error: "bad json" }); }
+    catch (e) { return res.status(400).json({ error: "bad json" }); }
 
     const { code, pid, data } = body;
     const room = rooms[code];
@@ -89,11 +97,11 @@ app.get("/poll", (req, res) => {
     res.json({ packets });
 });
 
-// POST /leave   body: {"code":1234,"pid":0}   → {"ok":true}
+// POST /leave   body: {"code":1234,"pid":0}
 app.post("/leave", (req, res) => {
     let body;
     try { body = JSON.parse(req.body); }
-    catch { return res.status(400).json({ error: "bad json" }); }
+    catch (e) { return res.status(400).json({ error: "bad json" }); }
 
     const { code, pid } = body;
     const room = rooms[code];
