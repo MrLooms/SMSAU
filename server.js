@@ -1,81 +1,82 @@
-// SMS Among Us — WebSocket Relay Server
-// Deploy on Render (render.com) as a Node web service.
-// Build command: npm install   Start command: node server.js
+// SMS Among Us - WebSocket Relay Server
+// Deploy to Render.com (free tier) as a Node.js web service.
+// All players connect here; the relay routes packets within a room.
 
-const WebSocket = require('ws');
-const PORT = process.env.PORT || 3000;
-
-// rooms[code] = [ws|null, ...] — up to 10 slots indexed by player_id
-const rooms = {};
+const WebSocket = require("ws");
+const PORT = process.env.PORT || 8080;
 
 const wss = new WebSocket.Server({ port: PORT });
-console.log(`SMS Among Us relay running on port ${PORT}`);
+const rooms = {}; // { roomCode: [ws|null, ...] }  (max 10 slots)
 
-wss.on('connection', ws => {
-    let room = null;
-    let slot = -1;
+console.log(`Relay listening on port ${PORT}`);
 
-    ws.on('message', (data, isBinary) => {
+wss.on("connection", (ws) => {
+    let room = null;   // array of slots for this room
+    let slot = -1;     // this client's slot index
+
+    ws.on("message", (data, isBinary) => {
+        // data is always a Buffer from the ws library
         if (!Buffer.isBuffer(data)) data = Buffer.from(data);
 
-        // --------------------------------------------------------
-        // Before the room-join we may receive GameMaker's
-        // proprietary "GMS handshake" bytes (desktop runner only).
-        // The handshake expects its data to be echoed back.
-        // Our room-join packet always starts with 0xFD, so anything
-        // else here is a GMS handshake step — just echo it and wait.
-        // HTML5 builds use the browser's native WebSocket and skip
-        // the GMS handshake entirely, so this branch is never hit.
-        // --------------------------------------------------------
+        // ---- Room-join handshake ----
+        // Client sends [0xFD, code_hi, code_lo] before any game packets.
         if (room === null) {
-            if (data.length === 0 || data[0] !== 0xFD) {
-                ws.send(data, { binary: true }); // echo GMS handshake
+            if (data.length < 3 || data[0] !== 0xFD) {
+                // Not a join packet; echo it back (handles GMS desktop handshake)
+                ws.send(data);
                 return;
             }
 
-            // Room-join handshake: [0xFD, code_hi, code_lo]
-            if (data.length < 3) { ws.close(1008, 'bad handshake'); return; }
             const code = (data[1] << 8) | data[2];
-
             if (!rooms[code]) rooms[code] = new Array(10).fill(null);
             room = rooms[code];
 
             slot = room.findIndex(s => s === null);
-            if (slot === -1) { ws.close(1013, 'room full'); return; }
-
+            if (slot === -1) {
+                // Room full
+                ws.close(1008, "Room full");
+                return;
+            }
             room[slot] = ws;
 
-            // Tell the new player their assigned ID: [PLAYER_JOIN=0, slot, 255]
+            // Tell the client its player ID slot (NET_MSG.PLAYER_JOIN = 0, flag 255 = ID assignment)
             ws.send(Buffer.from([0, slot, 255]));
+            console.log(`Room ${code}: slot ${slot} joined (${room.filter(Boolean).length} connected)`);
             return;
         }
 
-        // Regular game packet — broadcast to everyone else in the room
+        // ---- Broadcast to everyone else in the room ----
         for (let i = 0; i < room.length; i++) {
-            if (i !== slot && room[i] && room[i].readyState === WebSocket.OPEN)
-                room[i].send(data, { binary: true });
+            if (i !== slot && room[i] && room[i].readyState === WebSocket.OPEN) {
+                room[i].send(data);
+            }
         }
     });
 
-    ws.on('close', () => {
+    ws.on("close", () => {
         if (room === null || slot === -1) return;
         room[slot] = null;
+        console.log(`Slot ${slot} disconnected`);
 
-        // Notify everyone else this player left: [PLAYER_LEAVE=1, slot]
+        // Notify remaining players (NET_MSG.PLAYER_LEAVE = 1)
         const leaveMsg = Buffer.from([1, slot]);
         for (let i = 0; i < room.length; i++) {
-            if (room[i] && room[i].readyState === WebSocket.OPEN)
-                room[i].send(leaveMsg, { binary: true });
+            if (room[i] && room[i].readyState === WebSocket.OPEN) {
+                room[i].send(leaveMsg);
+            }
         }
 
-        // Clean up empty rooms
+        // Clean up empty room
         if (room.every(s => s === null)) {
-            const key = Object.keys(rooms).find(k => rooms[k] === room);
-            if (key !== undefined) delete rooms[key];
+            const code = Object.keys(rooms).find(k => rooms[k] === room);
+            if (code) {
+                delete rooms[code];
+                console.log(`Room ${code} cleaned up`);
+            }
         }
     });
 
-    ws.on('error', err => {
-        console.error('socket error:', err.message);
+    ws.on("error", (err) => {
+        console.error(`Socket error (slot ${slot}):`, err.message);
     });
 });
