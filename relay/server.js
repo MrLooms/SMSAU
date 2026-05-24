@@ -1,89 +1,118 @@
-// SMS Among Us - WebSocket Relay Server
-// Deploy to Render.com (free tier) as a Node.js web service.
-// All players connect here; the relay routes packets within a room.
+// SMS Among Us - HTTP Relay Server
+// Deploy to Render.com as a Node.js web service.
+// Players POST to /join, POST to /broadcast, GET /poll, POST to /leave.
 
-const WebSocket = require("ws");
-const PORT = process.env.PORT || 8080;
+const express = require("express");
+const cors    = require("cors");
+const app     = express();
 
-const wss = new WebSocket.Server({ port: PORT });
-const rooms = {}; // { roomCode: [ws|null, ...] }  (max 10 slots)
+app.use(cors());
+app.use(express.text({ type: "*/*" })); // read any POST body as plain text
 
-console.log(`Relay listening on port ${PORT}`);
+// rooms[code] = { slots: bool[10], players: { pid: { lastSeen, queue[] } } }
+const rooms = {};
 
-wss.on("connection", (ws) => {
-    let room = null;   // array of slots for this room
-    let slot = -1;     // this client's slot index
-
-    // Send a server-hello (0xFE) immediately so clients that don't receive
-    // network_type_connect (e.g. GXC/GX.games WASM runner) can still
-    // trigger the room-join sequence from a network_type_data event instead.
-    ws.send(Buffer.from([0xFE]));
-
-    ws.on("message", (data, isBinary) => {
-        // data is always a Buffer from the ws library
-        if (!Buffer.isBuffer(data)) data = Buffer.from(data);
-
-        // ---- Room-join handshake ----
-        // Client sends [0xFD, code_hi, code_lo] to join a room.
-        // Silently drop a duplicate join if already in a room.
-        if (data.length >= 1 && data[0] === 0xFD && room !== null) return;
-
-        if (room === null) {
-            if (data.length < 3 || data[0] !== 0xFD) {
-                // Not a join packet — echo it back (handles any GMS desktop handshake)
-                ws.send(data);
-                return;
-            }
-
-            const code = (data[1] << 8) | data[2];
-            if (!rooms[code]) rooms[code] = new Array(10).fill(null);
-            room = rooms[code];
-
-            slot = room.findIndex(s => s === null);
-            if (slot === -1) {
-                ws.close(1008, "Room full");
-                return;
-            }
-            room[slot] = ws;
-
-            // Tell the client its player ID (NET_MSG.PLAYER_JOIN = 0, flag 255 = ID assignment)
-            ws.send(Buffer.from([0, slot, 255]));
-            console.log(`Room ${code}: slot ${slot} joined (${room.filter(Boolean).length} connected)`);
-            return;
-        }
-
-        // ---- Broadcast to everyone else in the room ----
-        for (let i = 0; i < room.length; i++) {
-            if (i !== slot && room[i] && room[i].readyState === WebSocket.OPEN) {
-                room[i].send(data);
+// Remove players inactive for >30s, clean up empty rooms
+setInterval(() => {
+    const now = Date.now();
+    for (const code of Object.keys(rooms)) {
+        const room = rooms[code];
+        for (const pidStr of Object.keys(room.players)) {
+            if (now - room.players[pidStr].lastSeen > 30000) {
+                console.log(`Room ${code}: slot ${pidStr} timed out`);
+                const leaveMsg = `1,${pidStr}`;
+                for (const [op, other] of Object.entries(room.players)) {
+                    if (op !== pidStr) other.queue.push(leaveMsg);
+                }
+                delete room.players[pidStr];
+                room.slots[parseInt(pidStr)] = false;
             }
         }
-    });
-
-    ws.on("close", () => {
-        if (room === null || slot === -1) return;
-        room[slot] = null;
-        console.log(`Slot ${slot} disconnected`);
-
-        // Notify remaining players (NET_MSG.PLAYER_LEAVE = 1)
-        const leaveMsg = Buffer.from([1, slot]);
-        for (let i = 0; i < room.length; i++) {
-            if (room[i] && room[i].readyState === WebSocket.OPEN) {
-                room[i].send(leaveMsg);
-            }
+        if (Object.keys(room.players).length === 0) {
+            console.log(`Room ${code} cleaned up`);
+            delete rooms[code];
         }
+    }
+}, 10000);
 
-        // Clean up empty room
-        if (room.every(s => s === null)) {
-            const code = Object.keys(rooms).find(k => rooms[k] === room);
-            if (code) {
-                delete rooms[code];
-                console.log(`Room ${code} cleaned up`);
-            }
-        }
-    });
+// POST /join   body: {"code":1234}   → {"pid":0}
+app.post("/join", (req, res) => {
+    let body;
+    try { body = JSON.parse(req.body); }
+    catch { return res.status(400).json({ error: "bad json" }); }
 
-    ws.on("error", (err) => {
-        console.error(`Socket error (slot ${slot}):`, err.message);
-    });
+    const code = body.code;
+    if (typeof code !== "number" || code < 1000 || code > 9999)
+        return res.status(400).json({ error: "bad code" });
+
+    if (!rooms[code])
+        rooms[code] = { slots: new Array(10).fill(false), players: {} };
+    const room = rooms[code];
+
+    const pid = room.slots.findIndex(s => !s);
+    if (pid === -1) return res.status(503).json({ error: "room full" });
+
+    room.slots[pid] = true;
+    room.players[pid] = { lastSeen: Date.now(), queue: [] };
+
+    console.log(`Room ${code}: slot ${pid} joined (${Object.keys(room.players).length} connected)`);
+    res.json({ pid });
 });
+
+// POST /broadcast   body: {"code":1234,"pid":0,"data":"0,5,255"}   → {"ok":true}
+app.post("/broadcast", (req, res) => {
+    let body;
+    try { body = JSON.parse(req.body); }
+    catch { return res.status(400).json({ error: "bad json" }); }
+
+    const { code, pid, data } = body;
+    const room = rooms[code];
+    if (!room) return res.json({ ok: false });
+
+    for (const [opStr, other] of Object.entries(room.players)) {
+        if (parseInt(opStr) !== pid) other.queue.push(data);
+    }
+    res.json({ ok: true });
+});
+
+// GET /poll?code=1234&pid=0   → {"packets":["0,5,255","2,0,10,20,1"]}
+app.get("/poll", (req, res) => {
+    const code = parseInt(req.query.code);
+    const pid  = parseInt(req.query.pid);
+
+    const room = rooms[code];
+    if (!room || !room.players[pid]) return res.json({ packets: [] });
+
+    room.players[pid].lastSeen = Date.now();
+    const packets = room.players[pid].queue;
+    room.players[pid].queue = [];
+    res.json({ packets });
+});
+
+// POST /leave   body: {"code":1234,"pid":0}   → {"ok":true}
+app.post("/leave", (req, res) => {
+    let body;
+    try { body = JSON.parse(req.body); }
+    catch { return res.status(400).json({ error: "bad json" }); }
+
+    const { code, pid } = body;
+    const room = rooms[code];
+    if (!room || !room.players[pid]) return res.json({ ok: false });
+
+    const leaveMsg = `1,${pid}`;
+    for (const [opStr, other] of Object.entries(room.players)) {
+        if (parseInt(opStr) !== pid) other.queue.push(leaveMsg);
+    }
+    delete room.players[pid];
+    room.slots[pid] = false;
+
+    console.log(`Room ${code}: slot ${pid} left`);
+    if (Object.keys(room.players).length === 0) {
+        delete rooms[code];
+        console.log(`Room ${code} cleaned up`);
+    }
+    res.json({ ok: true });
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`HTTP relay listening on port ${PORT}`));
