@@ -1,12 +1,11 @@
 // SMS Among Us — WebSocket Relay Server
-// Deploy on Glitch (glitch.com) — paste both files and click Remix.
-// All game clients (host included) connect here; relay routes packets
-// within a room so no player ever needs to port-forward.
+// Deploy on Render (render.com) as a Node web service.
+// Build command: npm install   Start command: node server.js
 
 const WebSocket = require('ws');
 const PORT = process.env.PORT || 3000;
 
-// rooms[code] = [ws|null, ...] — 10 slots indexed by player_id
+// rooms[code] = [ws|null, ...] — up to 10 slots indexed by player_id
 const rooms = {};
 
 const wss = new WebSocket.Server({ port: PORT });
@@ -19,14 +18,23 @@ wss.on('connection', ws => {
     ws.on('message', (data, isBinary) => {
         if (!Buffer.isBuffer(data)) data = Buffer.from(data);
 
-        // --------------------------------------------------
-        // First message: room-join handshake [0xFD, hi, lo]
-        // --------------------------------------------------
+        // --------------------------------------------------------
+        // Before the room-join we may receive GameMaker's
+        // proprietary "GMS handshake" bytes (desktop runner only).
+        // The handshake expects its data to be echoed back.
+        // Our room-join packet always starts with 0xFD, so anything
+        // else here is a GMS handshake step — just echo it and wait.
+        // HTML5 builds use the browser's native WebSocket and skip
+        // the GMS handshake entirely, so this branch is never hit.
+        // --------------------------------------------------------
         if (room === null) {
-            if (data.length < 3 || data[0] !== 0xFD) {
-                ws.close(1008, 'bad handshake');
+            if (data.length === 0 || data[0] !== 0xFD) {
+                ws.send(data, { binary: true }); // echo GMS handshake
                 return;
             }
+
+            // Room-join handshake: [0xFD, code_hi, code_lo]
+            if (data.length < 3) { ws.close(1008, 'bad handshake'); return; }
             const code = (data[1] << 8) | data[2];
 
             if (!rooms[code]) rooms[code] = new Array(10).fill(null);
@@ -42,9 +50,7 @@ wss.on('connection', ws => {
             return;
         }
 
-        // --------------------------------------------------
-        // Regular game packet — broadcast to everyone else
-        // --------------------------------------------------
+        // Regular game packet — broadcast to everyone else in the room
         for (let i = 0; i < room.length; i++) {
             if (i !== slot && room[i] && room[i].readyState === WebSocket.OPEN)
                 room[i].send(data, { binary: true });
@@ -70,7 +76,6 @@ wss.on('connection', ws => {
     });
 
     ws.on('error', err => {
-        // Prevent server crash on individual socket errors
         console.error('socket error:', err.message);
     });
 });
